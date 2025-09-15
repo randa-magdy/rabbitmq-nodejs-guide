@@ -79,9 +79,73 @@ The exchange uses its type and bindings to determine how to route messages to qu
 
 ## Exchange Types and Message Flow
 
+### Default Exchange
+The default exchange is a direct exchange that has several special properties:
+
+It always exists (is pre-declared)
+Its name for AMQP 0-9-1 clients is an empty string ("")
+When a queue is declared, RabbitMQ will automatically bind that queue to the default exchange using its (queue) name as the routing key
+
+**Note**: 
+- The default exchange is used for its special properties. It is not supposed to be used as "regular" exchange that applications explicitly create bindings for.
+- For such cases where a direct exchange and a custom topology are necessary, consider declaring and using a separate direct exchange
+  
+```mermaid
+flowchart LR
+ subgraph RabbitMQ["RabbitMQ"]
+        Queue1["q1"]
+        DirectExchange["AMQP default"]
+  end
+    Publisher["Publisher"] -- Publish --> DirectExchange
+    DirectExchange -- q1 --> Queue1
+    Queue1 -- Consume --> Consumer["Consumer"]
+    Exchange@{ label: "Exchange : ''" }
+    log["key : q1"]
+
+    Exchange@{ shape: rect}
+    style Queue1 fill:#9f7aea,color:#fff
+    style DirectExchange fill:#000,color:#fff
+    style Publisher fill:#c53030,color:#fff
+    style Consumer fill:#c53030,color:#fff
+    style Exchange border:none,stroke-width:2px,stroke-dasharray: 2
+    style log stroke-width:2px,stroke-dasharray: 2
+```
+
+**Flow:**
+
+1. Publisher sends a message to the default exchange ("") with a routing key set to a specific queue's name (e.g., email-queue).
+2. The default exchange (a direct type) examines the message's routing key.
+3. It finds the queue that is bound with a routing key that is an exact match for the queue name (e.g., finds queue email-queue bound with key email-queue).
+4. The exchange delivers the message only to that single queue.
+5. Consumers subscribed to that queue receive the message.
+
+**In short**: Publishing to the default exchange with routing key X delivers the message directly and exclusively to the queue named X.
+**Use Case**: Simple, single-purpose apps
+
 ### Direct Exchange
 
 Routes messages to queues based on exact routing key matches.
+
+```mermaid
+flowchart LR
+    Publisher["Publisher"] -- Publish --> DirectExchange["amq.direct"]
+    log["key : log"]
+    subgraph "RabbitMQ"
+    DirectExchange -- log --> Queue1["q1"] & Queue2["q2"] 
+    DirectExchange --> Queue3["q3"]
+    end
+    Queue1 -- Consume --> Consumer["Consumer"]
+    Queue2 -- Consume --> Consumer
+    Queue3 -- Consume --> Consumer
+    
+    style Publisher fill:#c53030,color:#fff
+    style DirectExchange fill:#000,color:#fff
+    style Queue1 fill:#9f7aea,color:#fff
+    style Queue2 fill:#9f7aea,color:#fff
+    style Queue3 fill:#9f7aea,color:#fff
+    style Consumer fill:#c53030,color:#fff
+    style log stroke-width:2px,stroke-dasharray: 2
+```
 
 **Flow:**
 1. Publisher sends message to direct exchange with routing key `log`
@@ -93,7 +157,26 @@ Routes messages to queues based on exact routing key matches.
 
 ### Fanout Exchange
 
-Broadcasts messages to all bound queues, ignoring routing keys.
+Broadcasts messages to all bound queues, ignoring routing keys (No routing key is assigned).
+
+```mermaid
+flowchart LR
+    Publisher["Publisher"] -- Publish --> DirectExchange["amq.fanout"]
+    subgraph "RabbitMQ"
+    DirectExchange --> Queue1["q1"] & Queue2["q2"] 
+    Queue3["q3"]
+    end 
+    Queue1 -- Consume --> Consumer["Consumer"]
+    Queue2 -- Consume --> Consumer
+    Queue3 
+    
+    style Publisher fill:#c53030,color:#fff
+    style DirectExchange fill:#000,color:#fff
+    style Queue1 fill:#9f7aea,color:#fff
+    style Queue2 fill:#9f7aea,color:#fff
+    style Queue3 fill:#9f7aea,color:#fff
+    style Consumer fill:#c53030,color:#fff
+```
 
 **Flow:**
 1. Publisher sends message to fanout exchange
@@ -108,14 +191,65 @@ Routes messages using pattern matching with wildcards:
 - `*` matches exactly one word
 - `#` matches zero or more words
 
+```mermaid
+flowchart LR
+ subgraph RabbitMQ["RabbitMQ"]
+        Queue1["q1"]
+        Queue2["q2"]
+        Queue3["q3"]
+        DirectExchange["amq.topic"]
+  end
+  
+    Publisher["Publisher"] -- Publish --> DirectExchange
+    log["key : log.info"]
+    DirectExchange --log.info --> Queue1
+    DirectExchange --log.*--> Queue3
+    Queue1 -- Consume --> Consumer["Consumer"]
+    Queue2 -- Consume --> Consumer
+    Queue3 -- Consume --> Consumer
+
+    style Queue1 fill:#9f7aea,color:#fff
+    style Queue2 fill:#9f7aea,color:#fff
+    style Queue3 fill:#9f7aea,color:#fff
+    style DirectExchange fill:#000,color:#fff
+    style Publisher fill:#c53030,color:#fff
+    style Consumer fill:#c53030,color:#fff
+```
+
+```mermaid
+
+flowchart LR
+ subgraph RabbitMQ["RabbitMQ"]
+        Queue1["q1"]
+        Queue2["q2"]
+        Queue3["q3"]
+        DirectExchange["amq.topic"]
+  end
+  
+    Publisher["Publisher"] -- Publish --> DirectExchange
+    log["key : log.error"]
+    DirectExchange --log.error--> Queue2
+    DirectExchange --log.*--> Queue3
+    Queue1 -- Consume --> Consumer["Consumer"]
+    Queue2 -- Consume --> Consumer
+    Queue3 -- Consume --> Consumer
+
+    style Queue1 fill:#9f7aea,color:#fff
+    style Queue2 fill:#9f7aea,color:#fff
+    style Queue3 fill:#9f7aea,color:#fff
+    style DirectExchange fill:#000,color:#fff
+    style Publisher fill:#c53030,color:#fff
+    style Consumer fill:#c53030,color:#fff
+```
+
 **Example Bindings:**
 - `q1`: bound to `log.info`
 - `q2`: bound to `log.error`  
 - `q3`: bound to `log.*`
 
 **Scenarios:**
-- Message with `log.info` → routed to `q1` and `q3`
-- Message with `log.error` → routed to `q2` and `q3`
+- Message with route key `log.info` → routed to `q1` and `q3`
+- Message with route key `log.error` → routed to `q2` and `q3`
 
 **Use Case**: Flexible routing based on hierarchical topics (e.g., logging levels, geographic regions).
 
@@ -123,14 +257,63 @@ Routes messages using pattern matching with wildcards:
 
 Routes based on message headers rather than routing keys.
 
+```mermaid
+flowchart LR
+ subgraph RabbitMQ["RabbitMQ"]
+        Queue1["q1"]
+        Queue2["q2"]
+        Queue3["q3"]
+        DirectExchange["amq.headers"]
+  end
+  
+    Publisher["Publisher"] -- Publish --> DirectExchange
+    log["header(s) : info:1"]
+    DirectExchange --error:1 <br/> info:1--> Queue3
+    Queue1 -- Consume --> Consumer["Consumer"]
+    Queue2 -- Consume --> Consumer
+    Queue3 -- Consume --> Consumer
+
+    style Queue1 fill:#9f7aea,color:#fff
+    style Queue2 fill:#9f7aea,color:#fff
+    style Queue3 fill:#9f7aea,color:#fff
+    style DirectExchange fill:#000,color:#fff
+    style Publisher fill:#c53030,color:#fff
+    style Consumer fill:#c53030,color:#fff
+```
+
+```mermaid
+flowchart LR
+ subgraph RabbitMQ["RabbitMQ"]
+        Queue1["q1"]
+        Queue2["q2"]
+        Queue3["q3"]
+        DirectExchange["amq.headers"]
+  end
+  
+    Publisher["Publisher"] -- Publish --> DirectExchange
+    log["header(s) : error:1"]
+    DirectExchange --error:1--> Queue2
+    DirectExchange --error:1 <br/> info:1--> Queue3
+    Queue1 -- Consume --> Consumer["Consumer"]
+    Queue2 -- Consume --> Consumer
+    Queue3 -- Consume --> Consumer
+
+    style Queue1 fill:#9f7aea,color:#fff
+    style Queue2 fill:#9f7aea,color:#fff
+    style Queue3 fill:#9f7aea,color:#fff
+    style DirectExchange fill:#000,color:#fff
+    style Publisher fill:#c53030,color:#fff
+    style Consumer fill:#c53030,color:#fff
+```
+
 **Configuration:**
 - `x-match: all` - must match all specified headers
 - `x-match: any` - must match at least one header
 
 **Example:**
-- Queue bound with `{error: 1, info: 1, x-match: all}`
-- Only receives messages containing both `error: 1` AND `info: 1` headers
-
+- Queue bound with `{error: 1, info: 1, x-match: all}` → Receives messages containing both `error: 1` AND `info: 1` headers.
+- Queue bound with `{error: 1, info: 1, x-match: any}` → Receives messages containing either `error: 1` OR `info: 1` header.
+  
 **Use Case**: Complex routing based on multiple message attributes.
 
 ## Reliability and Durability
