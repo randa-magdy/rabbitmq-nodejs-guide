@@ -326,6 +326,23 @@ Messages aren't automatically removed from queues when delivered. Consumers must
 - **Negative Ack (`channel.nack(msg)`)**: Indicates failure, can requeue for retry
 - **Auto-Ack (`noAck: true`)**: ⚠️ **Risky** - automatically removes messages on delivery
 
+```mermaid
+flowchart LR
+ subgraph RabbitMQ["RabbitMQ"]
+        Queue1["q1"]
+        DirectExchange["Exchange"]
+  end
+    Publisher["Publisher"] -- Publish --> DirectExchange
+    DirectExchange --> Queue1
+    Queue1 -- Consume --> Consumer["Consumer"]
+    Consumer --Ack / N-Ack -->Queue1
+
+     style Queue1 fill:#9f7aea,color:#fff
+     style DirectExchange fill:#000,color:#fff
+     style Publisher fill:#c53030,color:#fff
+     style Consumer fill:#c53030,color:#fff
+```
+
 ### Message Persistence
 
 Two layers of durability:
@@ -349,36 +366,42 @@ Ensures messages reach the broker successfully:
 
 ## Node.js Examples with amqplib
 
-### Basic Setup
+### 1. Setup and Connection
+
+First, install the library:
 
 ```bash
 npm install amqplib
-```
+````
 
-### Producer Example
+### 2. Producer: Sending to a Direct Queue
+
+This example connects, creates a channel, declares a queue, and sends a single message.
 
 ```js
 const amqp = require('amqplib');
 
 async function produce() {
   try {
-    // Connect to RabbitMQ server
+    // 1. Connect to the RabbitMQ server
     const connection = await amqp.connect('amqp://localhost');
     const channel = await connection.createChannel();
 
-    // Declare durable queue
+    // 2. Declare a queue. If it doesn't exist, it will be created.
+    // durable: true means the queue will survive a broker restart
     const queueName = 'my_direct_queue';
     await channel.assertQueue(queueName, { durable: true });
 
+    // 3. Define the message
     const message = 'Hello, RabbitMQ from Node.js!';
 
-    // Send persistent message to queue
-    channel.sendToQueue(queueName, Buffer.from(message), { 
-      persistent: true 
-    });
+    // 4. Send the message to the queue
+    // The empty string '' as the exchange name denotes the default exchange.
+    // The default exchange is a direct exchange that routes messages to the queue named by the routingKey.
+    channel.sendToQueue(queueName, Buffer.from(message), { persistent: true });
     console.log(" [x] Sent '%s'", message);
 
-    // Close connection
+    // 5. Close the connection after a short delay
     setTimeout(() => {
       connection.close();
       process.exit(0);
@@ -391,30 +414,35 @@ async function produce() {
 produce();
 ```
 
-### Consumer Example
+### 3. Consumer: Receiving from a Queue
+
+This example connects, creates a channel, declares the same queue, and sets up a consumer to listen for messages.
 
 ```js
 const amqp = require('amqplib');
 
 async function consume() {
   try {
+    // 1. Connect to the RabbitMQ server
     const connection = await amqp.connect('amqp://localhost');
     const channel = await connection.createChannel();
 
+    // 2. Declare the same queue. This is idempotent.
     const queueName = 'my_direct_queue';
     await channel.assertQueue(queueName, { durable: true });
 
     console.log(" [*] Waiting for messages in %s. To exit press CTRL+C", queueName);
 
-    // Set up consumer with manual acknowledgement
+    // 3. Set up a consumer
+    // { noAck: false } means we will manually send acknowledgements.
     channel.consume(queueName, (msg) => {
       if (msg !== null) {
         console.log(" [x] Received '%s'", msg.content.toString());
-        
-        // Acknowledge message after processing
-        channel.ack(msg);
+
+        // For now, just ack immediately
+        channel.ack(msg); // Acknowledge the message processing is done
       }
-    }, { noAck: false });
+    }, { noAck: false }); // Manual acknowledgement mode
 
   } catch (error) {
     console.error(error);
@@ -424,19 +452,22 @@ async function consume() {
 consume();
 ```
 
-### Topic Exchange Example
+### 4. Using a Topic Exchange
+
+This example demonstrates the powerful **topic exchange pattern**.
 
 **Producer:**
 
 ```js
+// generateLogs.js
 const amqp = require('amqplib');
 
 async function generateLogs() {
   const connection = await amqp.connect('amqp://localhost');
   const channel = await connection.createChannel();
 
-  // Declare topic exchange
-  const exchangeName = 'logs_topic';
+  // Declare the topic exchange
+  const exchangeName = 'amq.topic'; // Or use 'logs_topic'
   await channel.assertExchange(exchangeName, 'topic', { durable: true });
 
   const logLevels = ['info', 'warning', 'error'];
@@ -444,11 +475,12 @@ async function generateLogs() {
 
   setInterval(() => {
     count++;
+    // Choose a random log level
     const severity = logLevels[Math.floor(Math.random() * 3)];
     const message = `Log ${severity} event #${count}`;
     const routingKey = `log.${severity}`;
 
-    // Publish with routing key
+    // Publish to the exchange with a routing key
     channel.publish(exchangeName, routingKey, Buffer.from(message));
     console.log(" [x] Sent '%s' with key '%s'", message, routingKey);
   }, 2000);
@@ -460,21 +492,23 @@ generateLogs();
 **Consumer:**
 
 ```js
+// logConsumer.js
 const amqp = require('amqplib');
 
 async function createConsumer(severityPattern, consumerTag) {
   const connection = await amqp.connect('amqp://localhost');
   const channel = await connection.createChannel();
 
-  const exchangeName = 'logs_topic';
+  const exchangeName = 'amq.topic';
+
+  // Assert the exchange
   await channel.assertExchange(exchangeName, 'topic', { durable: true });
 
-  // Create exclusive queue for this consumer
+  // Assert an exclusive, auto-delete queue. This is common for temporary consumers.
   const q = await channel.assertQueue('', { exclusive: true });
 
+  // Create bindings based on the pattern
   console.log(`Consumer ${consumerTag} waiting for logs with pattern '${severityPattern}'`);
-  
-  // Bind queue to exchange with pattern
   await channel.bindQueue(q.queue, exchangeName, severityPattern);
 
   channel.consume(q.queue, (msg) => {
@@ -485,10 +519,10 @@ async function createConsumer(severityPattern, consumerTag) {
   }, { noAck: false });
 }
 
-// Create consumers for different patterns
+// Create three different consumers for different patterns
 createConsumer('log.info', 'INFO_READER');
 createConsumer('log.error', 'ERROR_READER');
-createConsumer('log.*', 'ALL_LOGS_READER'); // Receives all log types
+createConsumer('log.*', 'ALL_LOGS_READER'); // Will get both info and error logs
 ```
 
 ### Reliable Publishing
@@ -576,6 +610,35 @@ consumeWithQoS();
 
 Handle messages that cannot be processed by routing them to a Dead Letter Exchange (DLX).
 
+```mermaid
+flowchart LR
+ subgraph RabbitMQ["RabbitMQ"]
+        DeadQueue["dead-queue"]
+        DirectExchange["Exchange"]
+  end
+    Publisher["Publisher"] -- Publish --> DirectExchange
+    DirectExchange --> DeadQueue
+    DeadQueue -- Consume --> Consumer["Consumer"]
+    Consumer -- Reject without requeue --> DeadExchange["Dead Exchange"]
+    DeadExchange --> Queue1["q1"]
+
+    style DeadQueue fill:#9f7aea,color:#fff
+    style DirectExchange fill:#000,color:#fff
+    style Publisher fill:#c53030,color:#fff
+    style Consumer fill:#c53030,color:#fff
+    style DeadExchange fill:#000,color:#fff
+    style Queue1 fill:#9f7aea,color:#fff
+```
+
+**How it works:**
+- Configure a queue (main-queue) to forward failed messages to a special exchange (the DLX) by setting the x-dead-letter-exchange argument. 
+- You can optionally set x-dead-letter-routing-key. 
+- Create another queue (dead-letter-queue) bound to this DLX. 
+- When a message in main-queue is rejected (channel.nack) or exceeds its retry limit, it is automatically rerouted to the DLX and then to the dead-letter-queue. 
+- You can then have a separate process to analyze the messages in the DLQ.
+  
+**When to use it:** For implementing retry logic, debugging failing messages, and handling poison pills (messages that consistently cause consumers to crash).
+
 **Setup:**
 
 ```js
@@ -598,7 +661,8 @@ async function setupDLQ() {
     durable: true,
     arguments: {
       'x-dead-letter-exchange': dlxName,
-      'x-message-ttl': 60000 // Optional: expire messages after 1 minute
+      'x-message-ttl': 60000, // Optional: expire messages after 1 minute
+      'x-dead-letter-routing-key': 'failed.message' // Optional new routing key
     }
   });
 
@@ -641,6 +705,31 @@ consumeWithRetries();
 ### Message TTL (Time To Live)
 
 Messages can expire after a specified time period.
+
+```mermaid
+flowchart LR
+ subgraph RabbitMQ["RabbitMQ"]
+        Queue["time-msg"]
+        DirectExchange["amq.direct"]
+  end
+    Publisher["Publisher"] -- Publish --> DirectExchange
+    DirectExchange --> Queue
+    Queue -- Expired --> Exchange2["amq.fanout"]
+    Exchange2 --> Queue1["expired-messages"]
+    n1[" "]
+
+    n1@{ icon: "aws:res-aws-backup-recovery-time-objective", pos: "b"}
+    style Queue fill:#9f7aea,color:#fff
+    style DirectExchange fill:#000,color:#fff
+    style Publisher fill:#c53030,color:#fff
+    style Exchange2 fill:#000,color:#fff
+    style Queue1 fill:#9f7aea,color:#fff
+    style n1 stroke:#FF6D00
+```
+
+**How it works:** You can set a TTL either on a queue (applies to all messages in the queue) or on a per-message basis. 
+
+**What happens:** When a message expires, it is automatically removed from the queue and, if configured, dead-lettered to a Dead Letter Exchange (DLX). This is useful for time-sensitive operations like "hold a booking for 15 minutes." 
 
 ```js
 // Set TTL on queue (applies to all messages)
