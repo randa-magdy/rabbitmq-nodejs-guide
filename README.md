@@ -757,7 +757,6 @@ flowchart LR
     style Publisher fill:#c53030,color:#fff
     style Exchange2 fill:#000,color:#fff
     style Queue1 fill:#9f7aea,color:#fff
-    style n1 stroke:#FF6D00
 ```
 
 **How it works:** You can set a TTL either on a queue (applies to all messages in the queue) or on a per-message basis. 
