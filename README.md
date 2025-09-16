@@ -345,16 +345,58 @@ flowchart LR
 
 ### Message Persistence
 
-Two layers of durability:
+Understanding durability is key to building a reliable system. It involves two layers: the queue and the message itself. 
+ - **Queue Durability:** A durable queue (durable: true) will survive a broker restart. Its definition is saved to disk. A transient queue (durable: false) will be deleted on broker restart. 
+ - **Message Delivery Mode:** A message can be persistent (saved to disk) or non-persistent (only stored in memory for performance). 
 
-| Queue Type | Message Mode | Result |
+**Crucial Interaction:** The final persistence of a message depends on both the queue's durability and its own delivery mode. 
+
+| Queue Type | Message Delivery Mode  | Resulting Message State |
 |------------|--------------|---------|
-| Durable | Persistent | ✅ Survives broker restart |
-| Durable | Non-persistent | ❌ Lost on restart |
-| Transient | Persistent | ❌ Lost on restart |
-| Transient | Non-persistent | ❌ Lost on restart |
+| Durable | Persistent | Persistent (on disk) |
+| Durable | Non-persistent | Non-persistent (in memory only)  |
+| Transient | Persistent | Non-persistent (lost on restart)  |
+| Transient | Non-persistent | Non-persistent (lost on restart) |
 
 **Key Rule**: Messages are truly persistent only when marked persistent AND stored in durable queues.
+
+**Non-presistent Message**
+
+```mermaid
+flowchart LR
+ subgraph RabbitMQ["RabbitMQ"]
+        Queue1["transient"]
+        Exchange["Exchange"]
+  end
+    Publisher["Publisher"] -- Publish --> Exchange
+    Exchange --> Queue1
+    Queue1 --> Memory["Memory"]
+
+    style Queue1 fill:#9f7aea,color:#fff
+    style Exchange fill:#000,color:#fff
+    style Publisher fill:#c53030,color:#fff
+    style Memory fill:#c53030,color:#fff
+```
+
+**Presistent Message**
+
+```mermaid
+flowchart LR
+ subgraph RabbitMQ["RabbitMQ"]
+        Queue1["durable-q"]
+        Exchange["Exchange"]
+  end
+    Publisher["Publisher"] -- Publish --> Exchange
+    Exchange --> Queue1
+    Queue1 --> Memory["Memory"]
+    Queue1 --> Disk["Disk"]
+
+    style Queue1 fill:#9f7aea,color:#fff
+    style Exchange fill:#000,color:#fff
+    style Publisher fill:#c53030,color:#fff
+    style Memory fill:#c53030,color:#fff
+    style Disk fill:#c53030,color:#fff
+```
 
 ### Publisher Confirms
 
@@ -527,6 +569,38 @@ createConsumer('log.*', 'ALL_LOGS_READER'); // Will get both info and error logs
 
 ### Reliable Publishing
 
+How can a publisher be sure a message actually reached RabbitMQ? The basic publish method is a "fire-and-forget" operation. For reliability, you need Publisher Confirms. 
+
+**message successfully handled**
+
+```mermaid
+flowchart LR
+    Publisher--Publish(1)-->RabbitMQ
+    RabbitMQ --Confirm(2) -->  Publisher
+
+    style Publisher fill:#c53030,color:#fff
+    style RabbitMQ fill:#f27c1f,color:#fff
+```
+
+**message failure**
+
+```mermaid
+flowchart LR
+    Publisher--Publish(1)-->RabbitMQ--Return(2)-->Publisher
+    RabbitMQ --Error(3 -->  Publisher
+    
+    style Publisher fill:#c53030,color:#fff
+    style RabbitMQ fill:#f27c1f,color:#fff
+```
+
+**How it works:**
+- The publisher puts the channel into confirm mode. 
+- It publishes a message. 
+- RabbitMQ responds with a basic.ack (confirm) if the message was successfully handled by the broker (e.g., routed to a queue). 
+- RabbitMQ responds with a basic.nack or a basic.return (if mandatory is set) if the message could not be processed or routed, indicating a failure. 
+
+This mechanism ensures messages are not lost on their way to the broker. 
+
 ```js
 const amqp = require('amqplib');
 
@@ -562,46 +636,6 @@ async function reliableProduce() {
 }
 
 reliableProduce();
-```
-
-### Quality of Service (QoS)
-
-```js
-const amqp = require('amqplib');
-
-async function consumeWithQoS() {
-  try {
-    const connection = await amqp.connect('amqp://localhost');
-    const channel = await connection.createChannel();
-
-    // Set prefetch to 1 - only one unacknowledged message at a time
-    await channel.prefetch(1);
-
-    const queueName = 'work_queue';
-    await channel.assertQueue(queueName, { durable: true });
-
-    console.log(" [*] Waiting for messages. Prefetch is 1.");
-
-    channel.consume(queueName, async (msg) => {
-      if (msg !== null) {
-        console.log(" [x] Received '%s'", msg.content.toString());
-
-        // Simulate variable processing time
-        const workDuration = Math.random() * 5000;
-        await new Promise(resolve => setTimeout(resolve, workDuration));
-
-        // Acknowledge after work is done
-        channel.ack(msg);
-        console.log(" [x] Done. Message acknowledged.");
-      }
-    }, { noAck: false });
-
-  } catch (error) {
-    console.error(error);
-  }
-}
-
-consumeWithQoS();
 ```
 
 ## Advanced Features
@@ -716,9 +750,8 @@ flowchart LR
     DirectExchange --> Queue
     Queue -- Expired --> Exchange2["amq.fanout"]
     Exchange2 --> Queue1["expired-messages"]
-    n1[" "]
+    Time["Time"]
 
-    n1@{ icon: "aws:res-aws-backup-recovery-time-objective", pos: "b"}
     style Queue fill:#9f7aea,color:#fff
     style DirectExchange fill:#000,color:#fff
     style Publisher fill:#c53030,color:#fff
@@ -747,19 +780,72 @@ channel.sendToQueue('my_queue', Buffer.from('Expiring message'), {
 });
 ```
 
-### Consumer Prefetch
+### Consumer Prefetch (Quality of Service - QoS)
+Prefetch controls how many messages are sent to a consumer before they are acknowledged. This is critical for balancing load. 
 
-Controls how many unacknowledged messages a consumer can have:
+```mermaid
+flowchart LR
+    RabbitMQ["RabbitMQ"] -- "Unacked &lt;= Prefetch Count" --> Consumer["Consumer"]
+    Consumer --> RestApis["RestApis"] & Database["Database"]
 
-```js
-// Only fetch 1 message at a time for fair distribution
-await channel.prefetch(1);
-
-// Fetch up to 5 messages for higher throughput
-await channel.prefetch(5);
+    style RabbitMQ fill:#f27c1f,color:#fff
+    style Consumer fill:#c53030,color:#fff
+    style RestApis fill:#FFD600
+    style Database fill:#00C853
 ```
 
-### Queue Limits and Overflow Behavior
+**The Problem:** Without a limit, RabbitMQ will send as many messages as it can to a consumer, potentially overwhelming it while other consumers sit idle. 
+
+**The Solution:** Set a prefetch count. This defines the maximum number of **unacknowledged messages** a consumer can have at any time. 
+  - **Example:** If prefetchCount = 1, RabbitMQ will send the next message to the consumer only after the previous one has been acked. This ensures fair distribution and prevents any single consumer from being flooded. 
+
+```js
+const amqp = require('amqplib');
+
+async function consumeWithQoS() {
+  try {
+    const connection = await amqp.connect('amqp://localhost');
+    const channel = await connection.createChannel();
+
+    // Set prefetch to 1 - only one unacknowledged message at a time
+    await channel.prefetch(1);
+
+    const queueName = 'work_queue';
+    await channel.assertQueue(queueName, { durable: true });
+
+    console.log(" [*] Waiting for messages. Prefetch is 1.");
+
+    channel.consume(queueName, async (msg) => {
+      if (msg !== null) {
+        console.log(" [x] Received '%s'", msg.content.toString());
+
+        // Simulate variable processing time
+        const workDuration = Math.random() * 5000;
+        await new Promise(resolve => setTimeout(resolve, workDuration));
+
+        // Acknowledge after work is done
+        channel.ack(msg);
+        console.log(" [x] Done. Message acknowledged.");
+      }
+    }, { noAck: false });
+
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+consumeWithQoS();
+```
+
+### Queue Capacity & Overflow Behavior
+
+Queues can have a maximum length to prevent them from growing indefinitely and consuming all disk/memory. 
+
+**Max Length:** The maximum number of messages a queue can hold. 
+
+**Overflow Behavior:** What happens when a queue is full? 
+   - **drop-head (default):** Delete the oldest message at the front of the queue to make space for the new one. 
+   - **reject-publish:** The broker will **reject** the new message (and trigger a nack to the publisher if using confirms). This is safer for ensuring no messages are silently dropped. 
 
 ```js
 await channel.assertQueue('limited_queue', {
@@ -774,8 +860,12 @@ await channel.assertQueue('limited_queue', {
 
 ### Consumer Priorities
 
-Higher priority consumers receive messages first when multiple consumers are idle:
+You can assign priorities to consumers. If multiple consumers are idle, the broker will preferentially send new messages to the consumer with the highest priority. 
 
+**Example:** Consumer 1 (prio=10), Consumer 2 (prio=5), Consumer 3 (prio=0). 
+**Result:** If all are idle, messages will be delivered first to Consumer 1, then 2, then 3. This is useful for giving more power to stronger machines or more important processing services. 
+
+ 
 ```js
 channel.consume(queueName, handleMessage, {
   noAck: false,
@@ -820,6 +910,12 @@ RabbitMQ permissions are granted per user per virtual host:
 
 Modern, replicated queue type built on Raft consensus algorithm. **Recommended for clustered setups.**
 
+**Configuration:**
+Quorum queues are declared with a special argument and have their own settings. 
+ - **x-queue-type: quorum:** The main argument to create a quorum queue.
+ - **x-quorum-initial-group-size:** The number of replicas for the queue (e.g., 3 for 2 tolerable node failures). 
+ - **x-dead-letter-strategy:** Can be set to at-least-once (more reliable DLQ routing) instead of the default at-most-once. 
+
 ```js
 await channel.assertQueue('ha-payment-queue', {
   durable: true,
@@ -831,11 +927,31 @@ await channel.assertQueue('ha-payment-queue', {
 });
 ```
 
-**Key Features:**
-- Always durable and persistent
-- Built-in replication across cluster nodes
-- Automatic poison message handling
-- Lazy by default (always writes to disk first)
+**Key Features:** 
+- **Replicated by Design:** Messages are synchronously replicated across a quorum (majority) of nodes in the cluster. This ensures data is not lost if a node fails. 
+- **Durable and Persistent:** They are always durable, and messages are always persistent. The durable and persistent flags are effectively always true. 
+- **Poison Message Handling:** If a message is negatively acknowledged (nack) and requeued multiple times (default: 3 times), Quorum Queues will automatically dead-letter it or drop it. This prevents a single broken message from blocking a queue indefinitely. 
+- **Lazy by Default:** They always write messages to disk first, preventing memory overload. 
+
+**Classic Queue vs Quorum Queue**
+
+| Feature                  | Classic   | Quorum   |
+|---------------------------|-----------|----------|
+| Non-durable queues        | Yes       | No       |
+| Exclusivity               | Yes       | No       |
+| Per message persistence   | Yes       | Always   |
+| Membership changes        | Automatic | Manual   |
+| Message TTL               | Yes       | Yes      |
+| Queue TTL                 | Yes       | Yes      |
+| Queue length limits       | Yes       | Yes      |
+| Lazy behavior             | Yes       | Always   |
+| Message priority          | Yes       | No       |
+| Consumer priority         | Yes       | Yes      |
+| Dead letter exchanges     | Yes       | Yes      |
+| Adheres to policies       | Yes       | Yes      |
+| Poison message handling   | No        | Yes      |
+| Global QoS Prefetch       | Yes       | No       |
+ 
 
 ### Clustering
 
