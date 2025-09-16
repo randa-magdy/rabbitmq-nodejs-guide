@@ -1369,7 +1369,7 @@ async function consumeErrorsOnly() {
 consumeErrorsOnly().catch(console.error); 
 ```
 
-**Cases for Streams:**
+**Use Cases for Streams:**
 
 - **Event Sourcing:** The stream is the system of record, storing every state change as an immutable event. 
 - **Audit Logs:** A perfect fit. Every action is appended to a stream, immutable and replayable for compliance audits. 
@@ -1513,8 +1513,10 @@ async function consumeFromSuperStream() {
  
 consumeFromSuperStream().catch(console.error); 
 ```
+
 **Output Example:**
 
+```bash
 [*] Consumer started on partition: orders-0 
 [*] Consumer started on partition: orders-1 
 [*] Consumer started on partition: orders-2 
@@ -1524,7 +1526,8 @@ consumeFromSuperStream().catch(console.error);
  [orders-0] Consumer 'order-processor-orders-0' processing order 0 for customer customer_0 
  [orders-1] Consumer 'order-processor-orders-1' processing order 4 for customer customer_1 
  [orders-2] Consumer 'order-processor-orders-2' processing order 5 for customer customer_2 
-... 
+...
+``` 
   
 
 **Note:** The built-in Super Stream consumer API in the client library can automate the management of consumers across partitions. The code above illustrates the conceptual principle. 
