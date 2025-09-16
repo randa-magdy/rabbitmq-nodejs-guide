@@ -909,6 +909,26 @@ RabbitMQ permissions are granted per user per virtual host:
 
 Modern, replicated queue type built on Raft consensus algorithm. **Recommended for clustered setups.**
 
+```mermaid
+flowchart LR
+ subgraph Setting["x-quorum-initial-group-size=3"]
+        Queue1["qu-queue"]
+        Exchange["Exchange"]
+  end
+    Publisher["Publisher"] -- Publish --> Exchange
+    Exchange --> Queue1
+    Queue1 --> RabbitMQ1["RabbitMQ"]
+    Queue1 --> RabbitMQ2["RabbitMQ"]
+    Queue1 --> RabbitMQ3["RabbitMQ"]
+
+    style Queue1 fill:#9f7aea,color:#fff
+    style Exchange fill:#000,color:#fff
+    style Publisher fill:#c53030,color:#fff
+    style RabbitMQ1 fill:#f27c1f,color:#fff
+    style RabbitMQ2 fill:#f27c1f,color:#fff
+    style RabbitMQ3 fill:#f27c1f,color:#fff
+```
+
 **Configuration:**
 Quorum queues are declared with a special argument and have their own settings. 
  - **x-queue-type: quorum:** The main argument to create a quorum queue.
@@ -950,7 +970,111 @@ await channel.assertQueue('ha-payment-queue', {
 | Adheres to policies       | Yes       | Yes      |
 | Poison message handling   | No        | Yes      |
 | Global QoS Prefetch       | Yes       | No       |
+
+**Poison Message Handling**
+
+```maidchart
+flowchart LR
+ subgraph RabbitMQ["RabbitMQ"]
+        Queue1["qu-queue"]
+        Exchange["Exchange"]
+  end
+    Publisher["Publisher"] -- Publish --> Exchange
+    Exchange --> Queue1--Consume(1)-->Consumer--N-Ack - Requeue (2)-->Queue1
+    Queue1--dead-letter/drop(3)--> DLDrop["DL or Drop"]
+    
+    style Queue1 fill:#9f7aea,color:#fff
+    style DLDrop fill:#9f7aea,color:#fff
+    style Exchange fill:#000,color:#fff
+    style Publisher fill:#c53030,color:#fff
+    style Consumer fill:#c53030,color:#fff
+```
+
+**Node.js Examples with amqplib (Quorum Queue)**
+
+`1. Declaring a Quorum Queue`
+This example shows how to declare a highly available, fault-tolerant quorum queue. 
+
+```js
+// quorumQueueProducer.js 
+const amqp = require('amqplib'); 
  
+async function produceToQuorumQueue() { 
+  const connection = await amqp.connect('amqp://localhost'); 
+  const channel = await connection.createChannel(); 
+ 
+  const queueName = 'ha-payment-queue'; 
+ 
+  // Declare a QUORUM queue with replication and poison message handling 
+  await channel.assertQueue(queueName, { 
+    durable: true, // This is redundant but good practice, as quorum queues are always durable. 
+    arguments: { 
+      'x-queue-type': 'quorum', // <- This is the key argument 
+      'x-quorum-initial-group-size': 3, // Create with 3 replicas 
+      // 'x-dead-letter-strategy': 'at-least-once', // Optional: more reliable DLQ 
+      // 'x-delivery-limit': 3 // Optional: max delivery attempts before being DLQ/dropped (default is also often 3) 
+    } 
+  }); 
+ 
+  const message = 'Payment transaction data'; 
+  channel.sendToQueue(queueName, Buffer.from(message), { persistent: true }); 
+  console.log(" [x] Sent message to quorum queue:", message); 
+ 
+  await channel.close(); 
+  await connection.close(); 
+} 
+ 
+produceToQuorumQueue(); 
+```
+
+`2. Consumer for a Quorum Queue (Handling Poison Messages)` 
+
+A consumer for a quorum queue is no different, but the queue's built-in behavior enhances reliability. 
+
+```js
+// quorumQueueConsumer.js 
+const amqp = require('amqplib'); 
+ 
+async function consumeFromQuorumQueue() { 
+  const connection = await amqp.connect('amqp://localhost'); 
+  const channel = await connection.createChannel(); 
+  await channel.prefetch(1); 
+ 
+  const queueName = 'ha-payment-queue'; 
+ 
+  console.log(" [*] Waiting for messages in %s.", queueName); 
+ 
+  channel.consume(queueName, async (msg) => { 
+    console.log(" [x] Received '%s'", msg.content.toString()); 
+ 
+    try { 
+      // Simulate your processing logic 
+      await processPayment(msg.content.toString()); 
+      // If successful, acknowledge the message 
+      channel.ack(msg); 
+      console.log(" [x] Processing successful. Ack sent."); 
+ 
+    } catch (error) { 
+      console.error(" [x] Processing FAILED:", error.message); 
+      // Negative acknowledge and DO NOT requeue. 
+      // Because it's a quorum queue, the broker tracks delivery count. 
+      // If this message fails too many times (e.g., 3), the broker will automatically 
+      // dead-letter it or drop it, preventing a poison message loop. 
+      channel.nack(msg, false, false); // (message, multiple, requeue) 
+    } 
+  }, { noAck: false }); 
+} 
+ 
+// Mock function that fails randomly 
+async function processPayment(data) { 
+  await new Promise(resolve => setTimeout(resolve, 1000)); // Simulate work 
+  if (Math.random() < 0.2) { // 20% chance of failure 
+    throw new Error("Insufficient funds"); 
+  } 
+} 
+ 
+consumeFromQuorumQueue(); 
+```
 
 ### Clustering
 
@@ -987,7 +1111,130 @@ Only one consumer in the group is active; others are standby until the active co
 
 ### RabbitMQ Streams
 
-Append-only log designed for high throughput and message replay:
+**RabbitMQ Streams** is not just another queue type; it's a distinct messaging paradigm within RabbitMQ modeled as an **append-only log**. It's optimized for high-throughput, long-term storage, and message replay, making it ideal for use cases where traditional queuing semantics are not sufficient. 
+
+**Key Characteristics:**
+- **Append-Only Log:** Messages are written sequentially to disk and assigned a unique, monotonically increasing offset (like an index number). 
+- **Time-Travelling / Replay:** Consumers can start reading from any point in the log (e.g., the beginning, a specific offset, a specific time). This is perfect for auditing, debugging, and feeding new services with historical data. 
+- **High Throughput:** Designed for publishing and consuming millions of messages per second by leveraging sequential disk I/O. 
+- **Large Fan-Out:** Efficiently supports a large number of consumers reading the same stream independently at their own pace. 
+- **Retention-Based Eviction:** Messages are not deleted when consumed. They are only removed based on retention policies (e.g., after 7 days, or when the log reaches 100 GB). 
+
+
+**Classic Queue vs Quorum Queue vs Streem**
+
+| Feature                  | Classic   | Quorum   | Stream           |
+|---------------------------|-----------|----------|------------------|
+|Data Model                 | FIFO Queue | FIFO Queue |Append Log     |
+| Message Consumption       | Destructive (Ack) |Destructive (Ack) |Non-destructive (Read)|
+| Non-durable queues        | Yes       | No       | No               |
+| Exclusivity               | Yes       | No       | No               |
+| Per message persistence   | Yes       | Always   | Always           |
+| Membership changes        | Automatic | Manual   | Manual           |
+| Message TTL               | Yes       | Yes      | No (Uses Retention)|
+| Queue TTL                 | Yes       | Yes      | No (Uses Retention)|
+| Queue length limits       | Yes       | Yes      | No (Uses Retention)|
+| Lazy behavior             | Yes       | Always   | Inherent         |
+| Message priority          | Yes       | No       | No               |
+| Consumer priority         | Yes       | Yes      | No               |
+| Dead letter exchanges     | Yes       | Yes      | No               |
+| Adheres to policies       | Yes       | Yes      | Check retention  |
+| Reacts to memory alarms   | Yes       | –        | No               |
+| Poison message handling   | No        | Yes      | No               |
+| Global QoS Prefetch       | Yes       | No       | No               |
+
+**Retention Policies:**
+Streams use arguments to control how long data is kept: 
+- **x-max-age:** Keep messages for a time duration (e.g., 7D for 7 days). 
+- **x-max-length-bytes:** Keep messages until the stream reaches a size limit (e.g., 100000000000 for ~100 GB). 
+- **x-stream-max-segment-size-bytes:** The size of individual segment files that make up the stream.
+  
+**Consumer Offset Management:**
+This is a critical concept for streams. 
+- Consumers track their position in the log by storing their **last processed offset**. 
+- On restart, a consumer can ask "What was the last offset I processed?" and then start reading from the next message (next). This provides **at-least-once** delivery guarantees. 
+- The broker can manage this offset storage, or the consumer can manage it themselves.
+
+**Filtering:**
+Streams support filtering messages upon consumption based on a property in the message header, allowing consumers to receive only a relevant subset of the data. 
+
+```mermaid
+flowchart LR
+
+    Publisher["Publisher"] -- Filter value --> RabbitMQ["RabbitMQ"]
+    RabbitMQ -. Filter value .-> Consumer["Consumer"]
+    L1["Message 1 with filter value<br>Message 2 with filter value<br>Message 3 without filter value"]
+    R1["Message 1 with filter value<br>Message 2 with filter value"]
+    L1 --- X((" "))
+    X --- R1
+
+    style Publisher fill:#c53030,color:#fff
+    style RabbitMQ fill:#f27c1f,color:#fff
+    style Consumer fill:#c53030,color:#fff
+    style X fill:none,stroke:none
+    linkStyle 2 stroke:none,fill:none
+    linkStyle 3 stroke:none
+```
+
+**Consumer Types:**
+- **Single Active Consumer (SAC):** Only one consumer is active at a time, others stay on standby.
+- **Consumer Groups (Competing Consumers):** Multiple consumers share a queue/partition, messages are load-balanced across them.
+
+```mermaid
+flowchart LR
+ subgraph s1["Single Consumer"]
+        Publisher["Publisher"]
+        RabbitMQ["RabbitMQ"]
+        Consumer1["Consumer1"] & Consumer2["Consumer2"] & Consumer3["Consumer3"]
+  end
+    Publisher["Publisher"] --> RabbitMQ["RabbitMQ"]
+    RabbitMQ --> Consumer1["Consumer1"] 
+    RabbitMQ -.-> Consumer2["Consumer2"] & Consumer3["Consumer3"]
+
+    style Publisher fill:#c53030,color:#fff
+    style RabbitMQ fill:#f27c1f,color:#fff
+    style Consumer1 fill:#c53030,color:#fff
+    style Consumer2 fill:#757575,color:#fff
+    style Consumer3 fill:#757575,color:#fff
+```
+```mermaid
+flowchart LR
+ subgraph G1["G1"]
+        Consumer1["Consumer1"]
+        Consumer2["Consumer2"]
+  end
+ subgraph G2["G2"]
+        Consumer3["Consumer3"]
+        Consumer4["Consumer4"]
+  end
+ subgraph s1["Grouped Single Consumer"]
+        Publisher["Publisher"]
+        RabbitMQ["RabbitMQ"]
+        G1
+        G2
+        Database["Database"]
+        Phone["Phone"]
+  end
+    Publisher -- Order Object --> RabbitMQ
+    RabbitMQ -- Order Object --> G1 & G2
+    G1 -- Update customer balance --> Database
+    G2 -- Send SMS --> Phone
+
+    style Consumer1 fill:#c53030,color:#fff
+    style Consumer2 fill:#757575,color:#fff
+    style Consumer3 fill:#757575,color:#fff
+    style Consumer4 fill:#c53030,color:#fff
+    style Publisher fill:#c53030,color:#fff
+    style RabbitMQ fill:#f27c1f,color:#fff
+    style Database stroke:#00C853
+    style Phone stroke:#FFD600
+```
+
+**Examples in Node.js (Streams)**
+
+**Note:** Streams require the rabbitmq_stream plugin to be enabled. You must use a dedicated client library like rabbitmq-streams-js as amqplib does not support the stream protocol. 
+
+First, install the stream client: 
 
 ```bash
 npm install rabbitmq-streams-client
@@ -995,109 +1242,300 @@ npm install rabbitmq-streams-client
 
 **Stream Producer:**
 
+This example shows how to connect to a stream and publish messages. 
+
 ```js
-const { Client } = require('rabbitmq-streams-client');
+// streamProducer.js 
+const { Client } = require('rabbitmq-streams-client'); 
+ 
+async function produceToStream() { 
+  // 1. Connect to the RabbitMQ stream port (usually 5552) 
+  const client = new Client('rabbitmq-stream://localhost:5552'); 
+  await client.connect(); 
+ 
+  // 2. Declare a stream with retention policies 
+  const streamName = 'application-log-stream'; 
+  await client.createStream(streamName, { 
+    'max-age': '2D', // Keep messages for 2 days 
+    'max-length-bytes': 5000000000, // ~5 GB max size 
+  }); 
+ 
+  // 3. Create a producer 
+  const producer = await client.declarePublisher({ stream: streamName }); 
+ 
+  for (let i = 0; i < 1000; i++) { 
+    const message = { 
+      level: i % 2 === 0 ? 'INFO' : 'ERROR', 
+      message: `Log event #${i}`, 
+      timestamp: new Date().toISOString() 
+    }; 
+ 
+    // 4. Send a message. You can add filtering properties. 
+    await producer.send(Buffer.from(JSON.stringify(message)), { 
+      applicationProperties: { 'level': message.level } // <- Used for filtering! 
+    }); 
+    console.log(` [x] Sent message ${i}`); 
+    await new Promise(resolve => setTimeout(resolve, 100)); 
+  } 
+ 
+  await client.close(); 
+} 
+ 
+produceToStream().catch(console.error); 
+```
 
-async function produceToStream() {
-  const client = new Client('rabbitmq-stream://localhost:5552');
-  await client.connect();
+**Consuming from a Stream with Offset Tracking**
 
-  const streamName = 'application-log-stream';
+This example shows a consumer that reads from a specific offset and tracks its progress. 
+
+```js
+// streamConsumer.js 
+const { Client, Offset } = require('rabbitmq-streams-client'); 
+ 
+async function consumeFromStream() { 
+  const client = new Client('rabbitmq-stream://localhost:5552'); 
+  await client.connect(); 
+ 
+  const streamName = 'application-log-stream'; 
+  const consumerName = 'my-log-processor'; 
+ 
+  // 1. Define where to start consuming from. 
+  // Options: Offset.first(), Offset.last(), Offset.next(), Offset.offset(1234), Offset.timestamp(1640995200000) 
+  const startOffset = Offset.first(); // Start from the very beginning to replay all logs 
+ 
+  // 2. Create the consumer with offset storage managed by the broker 
+  const consumer = await client.declareConsumer({ 
+    stream: streamName, 
+    name: consumerName, // A unique name for this consumer to track its offset 
+    offset: startOffset, 
+    callback: async (message, context) => { 
+      // message.content is a Buffer 
+      const logEntry = JSON.parse(message.content.toString()); 
+      console.log(` [${context.offset}] ${logEntry.level}: ${logEntry.message}`); 
+ 
+      // Simulate processing 
+      await new Promise(resolve => setTimeout(resolve, 50)); 
+ 
+      // 3. The client can automatically store the offset on the broker. 
+      // Alternatively, you can manually store it less frequently for performance. 
+      context.storeOffset(); // Store the last processed offset 
+    } 
+  }); 
+ 
+  console.log(` [*] Consumer started on stream '${streamName}'. Reading from offset ${startOffset}.`); 
+  // Keep the consumer running 
+  await new Promise(() => {}); 
+} 
+ 
+consumeFromStream().catch(console.error); 
+```
+
+**Consuming with Filtering**
+
+This example shows how a consumer can filter messages based on a property, reducing the volume of data it needs to process. 
+
+```js
+// filteredStreamConsumer.js 
+const { Client, Offset } = require('rabbitmq-streams-client'); 
+ 
+async function consumeErrorsOnly() { 
+  const client = new Client('rabbitmq-stream://localhost:5552'); 
+  await client.connect(); 
+ 
+  const streamName = 'application-log-stream'; 
+  const consumerName = 'error-log-processor'; 
+ 
+  // 1. Create a consumer with a FILTER 
+  const consumer = await client.declareConsumer({ 
+    stream: streamName, 
+    name: consumerName, 
+    offset: Offset.next(), // Start from the next new message 
+    filter: { // <- The filter specification 
+      values: { 'level': 'ERROR' }, // Match messages where the 'level' header equals 'ERROR' 
+      matchUnfiltered: false // Do not receive messages that don't match the filter 
+    }, 
+    callback: async (message, context) => { 
+      const logEntry = JSON.parse(message.content.toString()); 
+      // This consumer will ONLY receive messages where level == 'ERROR' 
+      console.error(` [!] CRITICAL ERROR DETECTED: ${logEntry.message}`); 
+      context.storeOffset(); 
+    } 
+  }); 
+ 
+  console.log(" [*] Error consumer started, filtering for 'ERROR' level logs."); 
+  await new Promise(() => {}); 
+} 
+ 
+consumeErrorsOnly().catch(console.error); 
+```
+
+**Cases for Streams:**
+
+- **Event Sourcing:** The stream is the system of record, storing every state change as an immutable event. 
+- **Audit Logs:** A perfect fit. Every action is appended to a stream, immutable and replayable for compliance audits. 
+- **Data Pipeline Ingestion:** Streams can absorb massive volumes of data from IoT sensors or clickstreams, allowing multiple downstream analytics services to consume at their own pace. 
+- **Replay for Debugging:** Reproduce production issues by replaying the exact sequence of events that led to a bug. 
+- **Microservices Choreography:** Broadcast domain events via streams, allowing new services to be built that leverage the entire history of events.
+
   
-  // Create stream with retention policies
-  await client.createStream(streamName, {
-    'max-age': '2D', // Keep for 2 days
-    'max-length-bytes': 5000000000 // ~5 GB max size
-  });
-
-  const producer = await client.declarePublisher({ stream: streamName });
-
-  for (let i = 0; i < 1000; i++) {
-    const message = {
-      level: i % 2 === 0 ? 'INFO' : 'ERROR',
-      message: `Log event #${i}`,
-      timestamp: new Date().toISOString()
-    };
-
-    await producer.send(Buffer.from(JSON.stringify(message)), {
-      applicationProperties: { 'level': message.level } // For filtering
-    });
-  }
-
-  await client.close();
-}
-
-produceToStream();
-```
-
-**Stream Consumer with Filtering:**
-
-```js
-const { Client, Offset } = require('rabbitmq-streams-client');
-
-async function consumeErrorsOnly() {
-  const client = new Client('rabbitmq-stream://localhost:5552');
-  await client.connect();
-
-  const consumer = await client.declareConsumer({
-    stream: 'application-log-stream',
-    name: 'error-log-processor',
-    offset: Offset.first(), // Start from beginning for replay
-    filter: {
-      values: { 'level': 'ERROR' }, // Only ERROR messages
-      matchUnfiltered: false
-    },
-    callback: async (message, context) => {
-      const logEntry = JSON.parse(message.content.toString());
-      console.error(` [!] CRITICAL ERROR: ${logEntry.message}`);
-      context.storeOffset(); // Track progress
-    }
-  });
-
-  console.log(" [*] Error consumer started, filtering for 'ERROR' level logs.");
-}
-
-consumeErrorsOnly();
-```
-
 ### Super Streams
 
-Partitioned streams for horizontal scaling:
+**A Super Stream** is a logical stream that is partitioned across several underlying, physical streams. It is RabbitMQ's solution for scaling out stream processing: instead of having one massive stream that a single consumer must read sequentially, a super stream splits the data into multiple partitions, allowing multiple consumers to process data in parallel. 
+
+**Key Characteristics:** 
+
+- **Partitioning:** A single super stream (e.g., orders) is split into N individual streams (e.g., orders-0, orders-1, orders-2). 
+- **Parallel Consumption:** Each partition can be consumed by a different consumer, allowing the total workload to be distributed across a consumer group. 
+- **Ordering Guarantees:** Message ordering is preserved within a partition, but not across the entire super stream. This is the classic trade-off for scalability. 
+- **Routing:** Messages are routed to partitions based on their routing key (often a property like orderId or customerId). All messages for the same key will always go to the same partition, ensuring related messages are processed in order.
+
+**Why Use Super Streams?**
+
+- **To overcome the single-threaded consumer bottleneck:** A single consumer reading one stream can only process messages as fast as a single CPU core allows. Super Streams allow you to scale processing by adding more consumers. 
+- **To handle volumes beyond a single node's capacity:** Partitions can be distributed across different nodes in a cluster. 
+- **To maintain order within a context:** By using a meaningful routing key (e.g., customerId), all events for a single customer are processed in order by one consumer, while events for other customers are processed in parallel.
+
+**Consumer Group Semantics:**
+The diagrams illustrate different consumption patterns, which are achieved by how you configure your consumers: 
+
+- **Fan-Out (All Messages to All Consumers):** Not a typical stream pattern. This is more suited to Pub/Sub with exchanges. 
+- **Competing Consumers (Load Balancing):** A group of consumers reads from the same partition, sharing the load of that partition. This is not the standard pattern for Super Streams. 
+- **Parallel Processing (The Super Stream Pattern):** Each consumer in a group is assigned to read from a different partition. This is the primary use case for Super Streams, providing true parallelism. 
+- **Multiple Independent Groups:** Different applications can consume from the same Super Stream. For example, Group G1 (with consumers C1, C2) processes orders to update balances, while Group G2 (with consumers C3, C4) consumes the same messages to send SMS notifications. Each group independently reads all partitions. 
+
+**Examples in Node.js (Super Streams)**
+
+**Note:** Super Stream management (creation, deletion) is often done via the rabbitmq-streams CLI tool, as shown in the screenshot. The client library is used for producing and consuming. 
+
+**Creating a Super Stream (CLI)**
+
+Before writing code, you must create the Super Stream. This is typically done administratively. 
 
 ```bash
-# Create super stream with 3 partitions
-rabbitmq-streams add_super_stream orders --partitions 3
+# Create a super stream named 'orders' with 3 partitions 
+rabbitmq-streams add_super_stream orders --partitions 3 
+ 
+# Delete a super stream 
+rabbitmq-streams delete_super_stream orders 
 ```
 
-**Producer with Routing:**
+This command creates three underlying streams: orders-0, orders-1, and orders-2. 
+
+**Producing to a Super Stream** 
+
+The producer is responsible for providing a routing key to determine the partition. 
 
 ```js
-async function produceToSuperStream() {
-  const client = new Client('rabbitmq-stream://localhost:5552');
-  await client.connect();
-
-  const producer = await client.declarePublisher({ 
-    stream: 'orders', 
-    superStream: true 
-  });
-
-  for (let i = 0; i < 10; i++) {
-    const order = {
-      orderId: i,
-      customerId: `customer_${i % 3}`, // Routing key
-      amount: 100 * i
-    };
-
-    // Messages with same customerId go to same partition
-    await producer.send(Buffer.from(JSON.stringify(order)), {
-      routingKey: order.customerId
-    });
-  }
-
-  await client.close();
-}
+// superStreamProducer.js 
+const { Client } = require('rabbitmq-streams-client'); 
+ 
+async function produceToSuperStream() { 
+  const client = new Client('rabbitmq-stream://localhost:5552'); 
+  await client.connect(); 
+ 
+  const superStreamName = 'orders'; 
+ 
+  // The producer is declared for the super stream, not an individual partition 
+  const producer = await client.declarePublisher({ stream: superStreamName, superStream: true }); 
+ 
+  for (let i = 0; i < 10; i++) { 
+    const order = { 
+      orderId: i, 
+      customerId: `customer_${i % 3}`, // This will be our routing key 
+      amount: 100 * i, 
+      items: [/* ... */] 
+    }; 
+ 
+    const messageBuffer = Buffer.from(JSON.stringify(order)); 
+ 
+    // 3. Send the message with a ROUTING KEY. 
+    // The broker uses this key to hash and select the partition (e.g., orders-0, orders-1, orders-2). 
+    // All messages with the same routing key go to the same partition. 
+    await producer.send(messageBuffer, { 
+      routingKey: order.customerId // <- The crucial part for partitioning 
+    }); 
+ 
+    console.log(` [x] Sent order ${order.orderId} for customer ${order.customerId}`); 
+  } 
+ 
+  await client.close(); 
+} 
+ 
+produceToSuperStream().catch(console.error); 
 ```
+  
+**Consuming from a Super Stream (Parallel Processing)**
 
+This example shows how to create a group of consumers that together consume all partitions of a Super Stream in parallel. 
+
+```js
+// superStreamConsumer.js 
+const { Client, Offset } = require('rabbitmq-streams-client'); 
+ 
+async function consumeFromSuperStream() { 
+  const client = new Client('rabbitmq-stream://localhost:5552'); 
+  await client.connect(); 
+ 
+  const superStreamName = 'orders'; 
+  const consumerGroupName = 'order-processors'; // Name for this group of consumers 
+ 
+  // This function will create one consumer instance for a given partition 
+  const createConsumerForPartition = async (partitionName) => { 
+    const consumerName = `order-processor-${partitionName}`; 
+ 
+    const consumer = await client.declareConsumer({ 
+      stream: partitionName, // Consume from the specific partition stream 
+      name: consumerName, 
+      offset: Offset.next(), // Start from the next new message 
+      callback: async (message, context) => { 
+        const order = JSON.parse(message.content.toString()); 
+        console.log(` [${partitionName}] Consumer '${consumerName}' processing order ${order.orderId} for customer ${order.customerId}`); 
+        // Process the order... 
+        context.storeOffset(); 
+      } 
+    }); 
+    console.log(` [*] Consumer started on partition: ${partitionName}`); 
+    return consumer; 
+  }; 
+ 
+  // 4. Create a consumer for each partition in the super stream. 
+  // In a real scenario, these might be separate processes or containers. 
+  const consumers = await Promise.all([ 
+    createConsumerForPartition('orders-0'), 
+    createConsumerForPartition('orders-1'), 
+    createConsumerForPartition('orders-2') 
+  ]); 
+ 
+  console.log(" [*] All partition consumers are running. Processing orders in parallel."); 
+  // Keep the script running 
+  await new Promise(() => {}); 
+} 
+ 
+consumeFromSuperStream().catch(console.error); 
+```
+**Output Example:**
+
+[*] Consumer started on partition: orders-0 
+[*] Consumer started on partition: orders-1 
+[*] Consumer started on partition: orders-2 
+[*] All partition consumers are running. Processing orders in parallel. 
+ [orders-1] Consumer 'order-processor-orders-1' processing order 1 for customer customer_1 
+ [orders-2] Consumer 'order-processor-orders-2' processing order 2 for customer customer_2 
+ [orders-0] Consumer 'order-processor-orders-0' processing order 0 for customer customer_0 
+ [orders-1] Consumer 'order-processor-orders-1' processing order 4 for customer customer_1 
+ [orders-2] Consumer 'order-processor-orders-2' processing order 5 for customer customer_2 
+... 
+  
+
+**Note:** The built-in Super Stream consumer API in the client library can automate the management of consumers across partitions. The code above illustrates the conceptual principle. 
+
+**Use Case for Super Streams:**
+
+- **E-Commerce Platform:** An orders super stream is partitioned by customerId. This ensures all events for a single customer are ordered, while allowing the platform to process thousands of customer orders in parallel across a fleet of consumer workers. 
+- **IoT Telemetry:** A sensor-data super stream partitioned by deviceId. Data from any single device is processed in order, while data from all devices is processed concurrently at massive scale. 
+- **Financial Transactions:** A transactions super stream partitioned by accountId. All debits and credits for a single account are processed sequentially to avoid race conditions, while transactions for millions of other accounts are handled simultaneously. 
+
+ 
 ## Integration and Plugins
 
 ### Federation Plugin
